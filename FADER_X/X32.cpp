@@ -96,8 +96,8 @@ void X32::touchEvent(int channel, Fader *fader){
 void X32::processOSC(OSCMessage msg){
   String oscAddr = msg.getAddress();
 
-//  Serial.print("revd: ");
-//  Serial.println(oscAddr);
+  Serial.print("revd: ");
+  Serial.println(oscAddr);
 
   if(xTarget == 1 && msg.match("/ch/*/mix/fader")){
     byte channel = msg.addressPart(1).toInt();

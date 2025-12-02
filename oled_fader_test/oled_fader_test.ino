@@ -15,6 +15,12 @@ using namespace qindesign::network;
 // I2C Configuration
 #define MULTIPLEXER_ADDR 0x70  // TCA9548A I2C multiplexer address
 
+// Motorized Fader Configuration
+#define MOTOR_MIN_SPEED 50
+#define MOTOR_MAX_SPEED 255
+#define MOTOR_DEADZONE 10
+#define POSITION_TOLERANCE 5
+
 // Network Configuration
 unsigned short receivePort = 8000;
 unsigned short sendPort = 9000;
@@ -36,6 +42,138 @@ TCA9548A multiplexer(MULTIPLEXER_ADDR);
 Adafruit_SSD1306 display0(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_SSD1306 display1(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Motorized Fader Class
+class MotorizedFader {
+  private:
+    int motorPinA;
+    int motorPinB;
+    int wiperPin;
+    int touchPin;
+    float targetPosition;  // 0.0 to 1.0
+    int currentRawPosition;
+    unsigned long lastMotorUpdate;
+    bool isMoving;
+    int adcMin;  // Minimum ADC value (fully down)
+    int adcMax;  // Maximum ADC value (fully up)
+    bool motorDirectionReversed;
+    
+  public:
+    MotorizedFader(int motorA, int motorB, int wiper, int touch) {
+      motorPinA = motorA;
+      motorPinB = motorB;
+      wiperPin = wiper;
+      touchPin = touch;
+      targetPosition = 0.5;  // Start at middle
+      currentRawPosition = 0;
+      lastMotorUpdate = 0;
+      isMoving = false;
+      adcMin = 50;    // Default minimum (adjust based on your fader)
+      adcMax = 973;   // Default maximum (adjust based on your fader)
+      motorDirectionReversed = false;  // Set to true if motor moves opposite direction
+    }
+    
+    void setup() {
+      pinMode(motorPinA, OUTPUT);
+      pinMode(motorPinB, OUTPUT);
+      pinMode(wiperPin, INPUT);
+      pinMode(touchPin, INPUT_PULLUP);
+      
+      // Get initial position
+      currentRawPosition = analogRead(wiperPin);
+      Serial.print("Fader initial ADC: ");
+      Serial.println(currentRawPosition);
+    }
+    
+    void setTargetPosition(float position) {
+      targetPosition = constrain(position, 0.0, 1.0);
+      isMoving = true;
+    }
+    
+    void setMotorDirectionReversed(bool reversed) {
+      motorDirectionReversed = reversed;
+    }
+    
+    void setADCRange(int minVal, int maxVal) {
+      adcMin = minVal;
+      adcMax = maxVal;
+    }
+    
+    void updateMotor() {
+      unsigned long now = millis();
+      if (now - lastMotorUpdate < 20) return;  // Update every 20ms
+      lastMotorUpdate = now;
+      
+      // Read current position
+      currentRawPosition = analogRead(wiperPin);
+      
+      // Convert target position to raw ADC value
+      int targetRaw = map(targetPosition * 1000, 0, 1000, adcMin, adcMax);
+      
+      // Calculate difference
+      int diff = targetRaw - currentRawPosition;
+      
+      // Check if we're close enough to target
+      if (abs(diff) < POSITION_TOLERANCE) {
+        // Stop motor
+        analogWrite(motorPinA, 0);
+        analogWrite(motorPinB, 0);
+        isMoving = false;
+        return;
+      }
+      
+      // Calculate motor speed based on distance
+      int speed = map(abs(diff), 0, (adcMax - adcMin) / 2, MOTOR_MIN_SPEED, MOTOR_MAX_SPEED);
+      speed = constrain(speed, MOTOR_MIN_SPEED, MOTOR_MAX_SPEED);
+      
+      // Move motor in correct direction
+      bool shouldMoveUp = diff > MOTOR_DEADZONE;
+      if (motorDirectionReversed) {
+        shouldMoveUp = !shouldMoveUp;
+      }
+      
+      if (shouldMoveUp) {
+        // Move up (towards higher ADC values)
+        analogWrite(motorPinA, speed);
+        analogWrite(motorPinB, 0);
+      } else if (diff < -MOTOR_DEADZONE) {
+        // Move down (towards lower ADC values)
+        analogWrite(motorPinA, 0);
+        analogWrite(motorPinB, speed);
+      } else {
+        // Stop if in deadzone
+        analogWrite(motorPinA, 0);
+        analogWrite(motorPinB, 0);
+      }
+    }
+    
+    float getCurrentPosition() {
+      int clampedADC = constrain(currentRawPosition, adcMin, adcMax);
+      return (float)(clampedADC - adcMin) / (adcMax - adcMin);
+    }
+    
+    float getTargetPosition() {
+      return targetPosition;
+    }
+    
+    bool isBeingTouched() {
+      return digitalRead(touchPin) == LOW;
+    }
+    
+    void stop() {
+      analogWrite(motorPinA, 0);
+      analogWrite(motorPinB, 0);
+      isMoving = false;
+    }
+    
+    int getCurrentADC() {
+      return currentRawPosition;
+    }
+};
+
+// Create motorized fader objects
+MotorizedFader motorFader1(0, 1, 9, 10);  // Pins: motor A,B, wiper, touch
+MotorizedFader motorFader2(2, 3, 11, 12); // Pins: motor A,B, wiper, touch
+
 // FaderOLED Class
 class FaderOLED {
   private:
@@ -44,19 +182,26 @@ class FaderOLED {
     String oscAddress;
     Adafruit_SSD1306* display;
     uint8_t multiplexerChannel;
+    MotorizedFader* motorFader;
     
   public:
-    FaderOLED(String faderName, String address, Adafruit_SSD1306* oledDisplay, uint8_t muxChannel) {
+    FaderOLED(String faderName, String address, Adafruit_SSD1306* oledDisplay, uint8_t muxChannel, MotorizedFader* motor) {
       name = faderName;
       value = 0.0;
       oscAddress = address;
       display = oledDisplay;
       multiplexerChannel = muxChannel;
+      motorFader = motor;
     }
     
     void setValue(float newValue) {
       value = constrain(newValue, 0.0, 1.0);
       updateDisplay();
+      
+      // Also set motor position
+      if (motorFader) {
+        motorFader->setTargetPosition(value);
+      }
     }
     
     float getValue() {
@@ -112,17 +257,24 @@ class FaderOLED {
       multiplexer.closeChannel(multiplexerChannel);
       updateDisplay();
     }
+    
+    void updateMotor() {
+      if (motorFader) {
+        motorFader->updateMotor();
+      }
+    }
 };
 
 // Create fader objects
-FaderOLED fader1("Fader1", "/fader/1", &display0, 0);
-FaderOLED fader2("Fader2", "/fader/2", &display1, 1);
+FaderOLED fader1("Fader1", "/fader/1", &display0, 0, &motorFader1);
+FaderOLED fader2("Fader2", "/fader/2", &display1, 1, &motorFader2);
+
+// Debug Configuration
+#define DEBUG_OSC 0  // Set to 1 to enable OSC debug output, 0 to disable
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println("OLED Fader Test Starting...");
   
   // Initialize I2C
   Wire.begin();
@@ -132,135 +284,75 @@ void setup() {
   multiplexer.begin(Wire);
   multiplexer.closeAll();  // Start with all channels closed
   
-  Serial.println("Initializing OLED displays...");
+  // Initialize motorized faders
+  motorFader1.setup();
+  motorFader2.setup();
   
-  // Initialize displays
+  // Configure fader ADC ranges and motor directions
+  motorFader1.setADCRange(60, 963);
+  motorFader2.setADCRange(60, 963);
+  motorFader1.setMotorDirectionReversed(false);
+  motorFader2.setMotorDirectionReversed(false);
+  
+  // Initialize OLED displays
   fader1.init();
   fader2.init();
-  
-  Serial.println("OLED displays initialized");
   
   // Initialize Ethernet
   bool ethernetStarted = false;
   
   if (useStaticIP) {
-    Serial.print("Configuring static IP: ");
-    Serial.println(staticIP);
     ethernetStarted = Ethernet.begin(staticIP, subnet, gateway);
   } else {
-    Serial.println("Requesting IP address via DHCP...");
     ethernetStarted = Ethernet.begin();
     
     if (ethernetStarted) {
       if (!Ethernet.waitForLocalIP(5000)) {
-        Serial.println("DHCP timeout - no IP assigned");
         ethernetStarted = false;
       }
     }
   }
   
   if (ethernetStarted) {
-    Serial.print("Ethernet initialized. IP: ");
-    Serial.println(Ethernet.localIP());
-  } else {
-    Serial.println("Failed to initialize Ethernet");
-    return;
+    udpReceiver.begin(receivePort);
+    udpSender.begin(0);
   }
-  
-  // Start UDP receiver
-  if (udpReceiver.begin(receivePort)) {
-    Serial.print("OSC Receiver listening on port ");
-    Serial.println(receivePort);
-  } else {
-    Serial.println("Failed to start UDP receiver");
-  }
-  
-  // Start UDP sender
-  if (udpSender.begin(0)) {
-    Serial.println("UDP Sender ready");
-  } else {
-    Serial.println("Failed to start UDP sender");
-  }
-  
-  Serial.print("Forwarding OSC messages to ");
-  Serial.print(sendIP);
-  Serial.print(":");
-  Serial.println(sendPort);
-  Serial.println("Ready!");
 }
 
 void loop() {
-  // Process all available OSC packets
+  // Print wiper readings
+  Serial.print("Fader1 ADC: ");
+  Serial.print(motorFader1.getCurrentADC());
+  Serial.print(" Fader2 ADC: ");
+  Serial.println(motorFader2.getCurrentADC());
+  
+  // Process OSC packets (without debug output)
   while (true) {
     int packetSize = udpReceiver.parsePacket();
     if (packetSize <= 0) {
-      break; // No more packets available
+      break;
     }
     
-    Serial.print("Received OSC packet, size: ");
-    Serial.println(packetSize);
-
-    // Clear the buffer before reading
     memset(udpBuf, 0, sizeof(udpBuf));
-    
-    // Read the packet into buffer
     int len = udpReceiver.read(udpBuf, sizeof(udpBuf));
     if (len > 0) {
-      Serial.print("Read ");
-      Serial.print(len);
-      Serial.println(" bytes into buffer");
-      
-      // Debug: print first few bytes of buffer
-      Serial.print("Buffer start: ");
-      for(int i = 0; i < min(20, len); i++) {
-        if(udpBuf[i] >= 32 && udpBuf[i] <= 126) { // printable ASCII
-          Serial.print((char)udpBuf[i]);
-        } else {
-          Serial.print("[");
-          Serial.print((int)udpBuf[i]);
-          Serial.print("]");
-        }
-      }
-      Serial.println();
-      
-      // Create OSC message from buffer
       OSCMessage oscMsg(udpBuf, len);
-
-      // Print OSC message details
-      Serial.print("Parsed Address: '");
-      Serial.print(oscMsg.getAddress());
-      Serial.println("'");
-
-      Serial.print("Parameter count: ");
-      Serial.println(oscMsg.getParameterCount());
-
-      // Check if this is a fader value message
+      
       if (oscMsg.getParameterCount() > 0 && oscMsg.getParameterType(0) == 'f') {
         float newValue = oscMsg.getFloat(0);
-        Serial.print("Float value: ");
-        Serial.println(newValue);
         
-        // Check which fader this message is for
         if (fader1.matchesOSCAddress(oscMsg.getAddress())) {
-          Serial.print("Updating Fader 1 (");
-          Serial.print(fader1.getName());
-          Serial.print(") to: ");
-          Serial.println(newValue);
           fader1.setValue(newValue);
         } else if (fader2.matchesOSCAddress(oscMsg.getAddress())) {
-          Serial.print("Updating Fader 2 (");
-          Serial.print(fader2.getName());
-          Serial.print(") to: ");
-          Serial.println(newValue);
           fader2.setValue(newValue);
-        } else {
-          Serial.println("No fader matched this OSC address");
         }
       }
-    } else {
-      Serial.println("Failed to read UDP packet");
     }
   }
 
-  delay(10); // Small delay to prevent overwhelming serial output
+  // Update motorized faders
+  fader1.updateMotor();
+  fader2.updateMotor();
+
+  delay(100); // Print readings every 100ms
 }

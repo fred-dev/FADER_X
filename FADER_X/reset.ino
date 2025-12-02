@@ -155,7 +155,7 @@ void resetNetStatic(){
   EEPROM.write(34, 192); // Static IP
   EEPROM.write(35, 168); // Static IP
   EEPROM.write(36, 1);   // Static IP
-  EEPROM.write(37, 130); // Static IP
+  EEPROM.write(37, 150); // Static IP
 
   EEPROM.write(38, 255); // Subnet Mask
   EEPROM.write(39, 255); // Subnet Mask
